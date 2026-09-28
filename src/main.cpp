@@ -1,30 +1,10 @@
 /*
- * ================================================================
- * AI SMART GLASSES - ESP32-S3 + OV3660 + EDGE IMPULSE FOMO
- * ================================================================
+ * AI SMART GLASSES - ESP32-S3 + OV3660 + Edge Impulse FOMO
  *
- * Model contains five classes:
- *   car
- *   chair
- *   door
- *   person
- *   stop sign
- *
- * Audio:
- *   Each class maps to one track in /01.
- *
- * Boot:
- *   Plays car audio once as YX5300 hardware test.
- *
- * Camera:
- *   OV3660 JPEG 320x240
- *   JPEG -> RGB888
- *   RGB888 -> 96x96
- *   Edge Impulse FOMO
- *
- * Serial:
- *   115200 baud
- * ================================================================
+ * Classes  : car, chair, door, person, stop sign
+ * Alerts   : YX5300 voice track (/01/001..005) + buzzer beep pattern
+ * Pipeline : OV3660 JPEG 320x240 -> RGB888 160x120 -> 96x96 -> FOMO
+ * Buzzer   : GPIO14 (+) and GND (-)
  */
 
 #include <Arduino.h>
@@ -44,592 +24,211 @@
 // CONFIGURATION
 // ================================================================
 
-#define CAMERA_WIDTH       320
-#define CAMERA_HEIGHT      240
-#define INFERENCE_WIDTH    160
-#define INFERENCE_HEIGHT   120
+#define ENABLE_AUDIO   1
+#define ENABLE_BUZZER  1
+#define BUZZER_ACTIVE  0   // 0 = passive buzzer (pitch), 1 = active buzzer (on/off only)
 
-#define MODEL_WIDTH        EI_CLASSIFIER_INPUT_WIDTH
-#define MODEL_HEIGHT       EI_CLASSIFIER_INPUT_HEIGHT
+constexpr int      CAM_WIDTH  = 320, CAM_HEIGHT = 240;
+constexpr int      SRC_WIDTH  = 160, SRC_HEIGHT = 120;   // JPEG decoded at 1/2 scale
+constexpr int      MODEL_WIDTH  = EI_CLASSIFIER_INPUT_WIDTH;
+constexpr int      MODEL_HEIGHT = EI_CLASSIFIER_INPUT_HEIGHT;
 
-#define ENABLE_AUDIO       1
+constexpr float    DETECTION_THRESHOLD    = 0.50f;
+constexpr uint32_t ALERT_COOLDOWN_MS      = 3000;
+constexpr uint32_t INFERENCE_INTERVAL_MS  = 250;
+constexpr size_t   WEB_JPEG_MAX           = 128 * 1024;
 
-// Detection threshold.
-// Edge Impulse export threshold is 0.50 in your model.
-// Start with 0.50 for testing.
-#define DETECTION_THRESHOLD 0.50f
-
-// Prevent repeated detections from interrupting the current announcement.
-#define AUDIO_COOLDOWN_MS   3000UL
-
-// Keep the camera/web stream responsive while avoiding redundant inference.
-// The latest frame is always copied for the web; inference runs at this rate.
-#define INFERENCE_INTERVAL_MS 250UL
-
-// Camera orientation
-#define CAMERA_VFLIP        1
-#define CAMERA_HMIRROR      0
-
-
-// ================================================================
-// MODEL CHECKS
-// ================================================================
+constexpr size_t   MODEL_PIXELS = (size_t)MODEL_WIDTH * MODEL_HEIGHT;
+constexpr size_t   SRC_BYTES    = (size_t)SRC_WIDTH * SRC_HEIGHT * 3;
 
 #if EI_CLASSIFIER_OBJECT_DETECTION != 1
 #error "This is not an Edge Impulse object detection model."
 #endif
-
-static_assert(EI_CLASSIFIER_INPUT_WIDTH == 96,
-              "Expected 96x96 Edge Impulse model.");
-
-static_assert(EI_CLASSIFIER_INPUT_HEIGHT == 96,
+static_assert(EI_CLASSIFIER_INPUT_WIDTH == 96 && EI_CLASSIFIER_INPUT_HEIGHT == 96,
               "Expected 96x96 Edge Impulse model.");
 
 
 // ================================================================
-// IMAGE BUFFERS
+// GLOBALS
 // ================================================================
 
-constexpr size_t MODEL_PIXELS =
-    (size_t)MODEL_WIDTH * MODEL_HEIGHT;
-
-constexpr size_t MODEL_RGB_BYTES =
-    MODEL_PIXELS * 3;
-
-constexpr size_t FULL_RGB_BYTES =
-    (size_t)INFERENCE_WIDTH * INFERENCE_HEIGHT * 3;
-
-
-// 96x96 RGB image
-static uint8_t modelRgb[MODEL_RGB_BYTES];
-
-// 320x240 decoded RGB image
-static uint8_t *fullRgb = nullptr;
-static uint8_t *latestJpeg = nullptr;
-static size_t latestJpegLength = 0;
-
-static WebServer webServer(80);
-static char latestDetection[32] = "none";
-static float latestConfidence = 0.0f;
-static uint32_t latestInferenceMs = 0;
-static uint32_t latestFrameMs = 0;
-static uint32_t latestBoxes = 0;
-static uint16_t latestBoxX = 0;
-static uint16_t latestBoxY = 0;
-static uint16_t latestBoxWidth = 0;
-static uint16_t latestBoxHeight = 0;
+static uint8_t  modelRgb[MODEL_PIXELS * 3];   // 96x96 RGB
+static uint8_t *srcRgb  = nullptr;            // 160x120 RGB (PSRAM)
+static uint8_t *webJpeg = nullptr;            // latest JPEG for the web page (PSRAM)
+static size_t   webJpegLen = 0;
 static SemaphoreHandle_t jpegMutex = nullptr;
 
+static WebServer webServer(80);
 
-// ================================================================
-// CAMERA TIMING
-// ================================================================
-
-struct CameraTiming {
-    uint32_t grabUs;
-    uint32_t decodeUs;
-    uint32_t resizeUs;
+struct Status {
+    char     label[32];
+    float    conf;
+    uint32_t boxes, inferMs, frameMs;
+    uint16_t x, y, w, h;
 };
+static Status status = {"none"};
+
+struct CameraTiming { uint32_t grabUs, decodeUs, resizeUs; };
 
 
 // ================================================================
-// CAMERA ERROR HELPER
+// SQUASH RESIZE (RGB888, bilinear, matches Edge Impulse pipeline)
 // ================================================================
 
-static void checkCameraSetting(const char *name, int rc)
+static void squashRgb888(const uint8_t *src, int srcW, int srcH,
+                         uint8_t *dst, int dstW, int dstH)
 {
-    if (rc != 0) {
-        Serial.printf("[CAM] WARNING: %s returned %d\n",
-                      name, rc);
-    }
-}
-
-
-// ================================================================
-// EDGE IMPULSE STYLE SQUASH RESIZE
-// ================================================================
-//
-// 320x240 RGB888 -> 96x96 RGB888
-//
-// This is squash resizing, matching the image processing approach
-// used by the Edge Impulse image pipeline.
-// ================================================================
-
-static bool squashRgb888(
-    const uint8_t *src,
-    int srcWidth,
-    int srcHeight,
-    uint8_t *dst,
-    int dstWidth,
-    int dstHeight)
-{
-    if (!src || !dst) {
-        return false;
-    }
-
-    if (srcWidth < 2 || srcHeight < 2) {
-        return false;
-    }
-
     constexpr int FRAC_BITS = 14;
-    constexpr int FRAC_VAL  = (1 << FRAC_BITS);
-    constexpr int FRAC_MASK = FRAC_VAL - 1;
+    constexpr uint32_t FRAC_VAL  = 1u << FRAC_BITS;
+    constexpr uint32_t FRAC_MASK = FRAC_VAL - 1;
+    constexpr int PX = 3;
 
-    constexpr int PIXEL_SIZE = 3;
+    const uint32_t xStep = ((uint32_t)srcW << FRAC_BITS) / dstW;
+    const uint32_t yStep = ((uint32_t)srcH << FRAC_BITS) / dstH;
+    const int rowBytes = srcW * PX;
 
-    const uint32_t srcXFrac =
-        ((uint32_t)srcWidth * FRAC_VAL) / dstWidth;
+    uint32_t yAcc = 0;
+    for (int y = 0; y < dstH; y++, yAcc += yStep) {
+        const uint8_t *s = src + (size_t)(yAcc >> FRAC_BITS) * rowBytes;
+        const uint32_t yf = yAcc & FRAC_MASK, nyf = FRAC_VAL - yf;
 
-    const uint32_t srcYFrac =
-        ((uint32_t)srcHeight * FRAC_VAL) / dstHeight;
+        uint32_t xAcc = 0;
+        for (int x = 0; x < dstW; x++, xAcc += xStep) {
+            const uint8_t *p = s + (xAcc >> FRAC_BITS) * PX;
+            const uint32_t xf = xAcc & FRAC_MASK, nxf = FRAC_VAL - xf;
 
-    const int srcWidthBytes =
-        srcWidth * PIXEL_SIZE;
-
-    uint32_t srcYAccum = 0;
-
-    for (int y = 0; y < dstHeight; y++) {
-
-        const int ty = srcYAccum >> FRAC_BITS;
-
-        const uint32_t yFrac =
-            srcYAccum & FRAC_MASK;
-
-        srcYAccum += srcYFrac;
-
-        const uint32_t nyFrac =
-            FRAC_VAL - yFrac;
-
-        const uint8_t *s =
-            &src[(size_t)ty * srcWidthBytes];
-
-        uint8_t *d =
-            &dst[(size_t)y * dstWidth * PIXEL_SIZE];
-
-        uint32_t srcXAccum = 0;
-
-        for (int x = 0; x < dstWidth; x++) {
-
-            const int tx =
-                (srcXAccum >> FRAC_BITS) * PIXEL_SIZE;
-
-            const uint32_t xFrac =
-                srcXAccum & FRAC_MASK;
-
-            srcXAccum += srcXFrac;
-
-            const uint32_t nxFrac =
-                FRAC_VAL - xFrac;
-
-            for (int c = 0; c < PIXEL_SIZE; c++) {
-
-                uint32_t p00 = s[tx + c];
-
-                uint32_t p10 = s[tx + PIXEL_SIZE + c];
-
-                uint32_t p01 =
-                    s[tx + srcWidthBytes + c];
-
-                uint32_t p11 =
-                    s[tx + srcWidthBytes + PIXEL_SIZE + c];
-
-                p00 =
-                    ((p00 * nxFrac) +
-                     (p10 * xFrac) +
-                     FRAC_VAL / 2) >> FRAC_BITS;
-
-                p01 =
-                    ((p01 * nxFrac) +
-                     (p11 * xFrac) +
-                     FRAC_VAL / 2) >> FRAC_BITS;
-
-                p00 =
-                    ((p00 * nyFrac) +
-                     (p01 * yFrac) +
-                     FRAC_VAL / 2) >> FRAC_BITS;
-
-                *d++ = (uint8_t)p00;
+            for (int c = 0; c < PX; c++) {
+                uint32_t top = (p[c] * nxf + p[PX + c] * xf + FRAC_VAL / 2) >> FRAC_BITS;
+                uint32_t bot = (p[rowBytes + c] * nxf + p[rowBytes + PX + c] * xf + FRAC_VAL / 2) >> FRAC_BITS;
+                *dst++ = (uint8_t)((top * nyf + bot * yf + FRAC_VAL / 2) >> FRAC_BITS);
             }
         }
     }
-
-    return true;
 }
 
 
 // ================================================================
-// CAMERA INITIALIZATION
+// CAMERA
 // ================================================================
+
+#define CAM_SET(fn, v) \
+    do { if (sensor->fn(sensor, v)) Serial.println("[CAM] WARNING: " #fn " failed"); } while (0)
 
 static bool beginCamera()
 {
-    Serial.println();
-    Serial.println("[CAM] Initializing OV3660...");
+    Serial.println("\n[CAM] Initializing OV3660...");
 
     if (!psramFound()) {
+        Serial.println("[CAM] ERROR: PSRAM not detected.");
+        return false;
+    }
 
-        Serial.println(
-            "[CAM] ERROR: PSRAM not detected."
-        );
-
+    srcRgb  = (uint8_t *)heap_caps_malloc(SRC_BYTES,    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    webJpeg = (uint8_t *)heap_caps_malloc(WEB_JPEG_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!srcRgb || !webJpeg) {
+        Serial.println("[CAM] ERROR: buffer allocation failed.");
         return false;
     }
 
     camera_config_t cfg = {};
-
     cfg.ledc_channel = LEDC_CHANNEL_0;
     cfg.ledc_timer   = LEDC_TIMER_0;
 
-    // ------------------------------------------------------------
-    // YOUR ESP32-S3 OV3660 PINS
-    // ------------------------------------------------------------
-
-    cfg.pin_d0 = 11;
-    cfg.pin_d1 = 9;
-    cfg.pin_d2 = 8;
-    cfg.pin_d3 = 10;
-    cfg.pin_d4 = 12;
-    cfg.pin_d5 = 18;
-    cfg.pin_d6 = 17;
-    cfg.pin_d7 = 16;
-
-    cfg.pin_xclk  = 15;
-    cfg.pin_pclk  = 13;
-    cfg.pin_vsync = 6;
-    cfg.pin_href  = 7;
-
-    cfg.pin_sccb_sda = 4;
-    cfg.pin_sccb_scl = 5;
-
-    cfg.pin_pwdn  = -1;
-    cfg.pin_reset = -1;
-
-    // ------------------------------------------------------------
-    // CAMERA SETTINGS
-    // ------------------------------------------------------------
+    cfg.pin_d0 = 11; cfg.pin_d1 = 9;  cfg.pin_d2 = 8;  cfg.pin_d3 = 10;
+    cfg.pin_d4 = 12; cfg.pin_d5 = 18; cfg.pin_d6 = 17; cfg.pin_d7 = 16;
+    cfg.pin_xclk  = 15; cfg.pin_pclk = 13;
+    cfg.pin_vsync = 6;  cfg.pin_href = 7;
+    cfg.pin_sccb_sda = 4; cfg.pin_sccb_scl = 5;
+    cfg.pin_pwdn = -1;  cfg.pin_reset = -1;
 
     cfg.xclk_freq_hz = 20000000;
-
     cfg.pixel_format = PIXFORMAT_JPEG;
-
-    cfg.frame_size = FRAMESIZE_QVGA;
-
+    cfg.frame_size   = FRAMESIZE_QVGA;
     cfg.jpeg_quality = 10;
+    cfg.fb_count     = 2;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+    cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
-    cfg.fb_count = 2;
-
-    cfg.fb_location = CAMERA_FB_IN_PSRAM;
-
-    cfg.grab_mode = CAMERA_GRAB_LATEST;
-
-
-    const esp_err_t err =
-        esp_camera_init(&cfg);
-
+    const esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
-
-        Serial.printf(
-            "[CAM] ERROR: esp_camera_init failed: 0x%x\n",
-            (unsigned)err
-        );
-
+        Serial.printf("[CAM] ERROR: esp_camera_init failed: 0x%x\n", (unsigned)err);
         return false;
     }
 
-
-    sensor_t *sensor =
-        esp_camera_sensor_get();
-
+    sensor_t *sensor = esp_camera_sensor_get();
     if (!sensor) {
-
-        Serial.println(
-            "[CAM] ERROR: sensor not found."
-        );
-
-        esp_camera_deinit();
-
-        return false;
-    }
-
-
-    Serial.printf(
-        "[CAM] Sensor PID = 0x%04X\n",
-        (unsigned)sensor->id.PID
-    );
-
-
-    // ------------------------------------------------------------
-    // IMAGE ORIENTATION
-    // ------------------------------------------------------------
-
-    checkCameraSetting(
-        "vflip",
-        sensor->set_vflip(
-            sensor,
-            CAMERA_VFLIP
-        )
-    );
-
-    checkCameraSetting(
-        "hmirror",
-        sensor->set_hmirror(
-            sensor,
-            CAMERA_HMIRROR
-        )
-    );
-
-
-    // ------------------------------------------------------------
-    // IMAGE SETTINGS
-    // ------------------------------------------------------------
-
-    checkCameraSetting(
-        "brightness",
-        sensor->set_brightness(sensor, 1)
-    );
-
-    checkCameraSetting(
-        "contrast",
-        sensor->set_contrast(sensor, 0)
-    );
-
-    checkCameraSetting(
-        "saturation",
-        sensor->set_saturation(sensor, 0)
-    );
-
-    checkCameraSetting(
-        "white balance",
-        sensor->set_whitebal(sensor, 1)
-    );
-
-    checkCameraSetting(
-        "AWB gain",
-        sensor->set_awb_gain(sensor, 1)
-    );
-
-    checkCameraSetting(
-        "WB mode",
-        sensor->set_wb_mode(sensor, 0)
-    );
-
-    checkCameraSetting(
-        "gain control",
-        sensor->set_gain_ctrl(sensor, 1)
-    );
-
-    checkCameraSetting(
-        "exposure control",
-        sensor->set_exposure_ctrl(sensor, 1)
-    );
-
-    checkCameraSetting(
-        "colorbar",
-        sensor->set_colorbar(sensor, 0)
-    );
-
-
-    // ------------------------------------------------------------
-    // FULL RGB BUFFER
-    // ------------------------------------------------------------
-
-    fullRgb =
-        (uint8_t *)heap_caps_malloc(
-            FULL_RGB_BYTES,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-
-
-    if (!fullRgb) {
-
-        Serial.printf(
-            "[CAM] ERROR: Could not allocate %u bytes RGB buffer.\n",
-            (unsigned)FULL_RGB_BYTES
-        );
-
-        esp_camera_deinit();
-
-        return false;
-    }
-
-    latestJpeg =
-        (uint8_t *)heap_caps_malloc(
-            128 * 1024,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-
-    if (!latestJpeg) {
-        Serial.println("[CAM] ERROR: Could not allocate web JPEG buffer.");
-        heap_caps_free(fullRgb);
-        fullRgb = nullptr;
+        Serial.println("[CAM] ERROR: sensor not found.");
         esp_camera_deinit();
         return false;
     }
+    Serial.printf("[CAM] Sensor PID = 0x%04X\n", (unsigned)sensor->id.PID);
 
+    CAM_SET(set_vflip, 1);
+    CAM_SET(set_hmirror, 0);
+    CAM_SET(set_brightness, 1);
+    CAM_SET(set_contrast, 0);
+    CAM_SET(set_saturation, 0);
+    CAM_SET(set_whitebal, 1);
+    CAM_SET(set_awb_gain, 1);
+    CAM_SET(set_wb_mode, 0);
+    CAM_SET(set_gain_ctrl, 1);
+    CAM_SET(set_exposure_ctrl, 1);
+    CAM_SET(set_colorbar, 0);
 
-
-    // ------------------------------------------------------------
-    // CAMERA SETTLE
-    // ------------------------------------------------------------
-
-    Serial.println(
-        "[CAM] Letting exposure/WB settle..."
-    );
-
-    uint32_t start = millis();
-
-    while ((uint32_t)(millis() - start) < 1500UL) {
-
-        camera_fb_t *fb =
-            esp_camera_fb_get();
-
-        if (fb) {
+    // Let auto exposure / white balance settle.
+    Serial.println("[CAM] Letting exposure/WB settle...");
+    for (uint32_t start = millis(); millis() - start < 1500UL; delay(20)) {
+        if (camera_fb_t *fb = esp_camera_fb_get()) {
             esp_camera_fb_return(fb);
         }
-
-        delay(20);
     }
 
-
-    Serial.printf(
-        "[CAM] PSRAM total=%u bytes\n",
-        (unsigned)ESP.getPsramSize()
-    );
-
-    Serial.printf(
-        "[CAM] PSRAM free=%u bytes\n",
-        (unsigned)ESP.getFreePsram()
-    );
-
-    Serial.printf(
-        "[CAM] Heap free=%u bytes\n",
-        (unsigned)ESP.getFreeHeap()
-    );
-
-    Serial.println(
-        "[CAM] OV3660 READY."
-    );
-
+    Serial.printf("[CAM] READY | PSRAM free=%u | heap free=%u\n",
+                  (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
     return true;
 }
 
 
 // ================================================================
-// JPEG READER
+// JPEG DECODE CALLBACKS
 // ================================================================
 
 struct JpegContext {
-
     const uint8_t *src;
-
-    size_t len;
-
+    size_t   len;
     uint8_t *dst;
-
-    uint16_t width;
-    uint16_t height;
-
-    bool dimensionsOk;
+    uint16_t width, height;
+    bool     dimensionsOk;
 };
 
-
-static size_t jpegRead(
-    void *arg,
-    size_t index,
-    uint8_t *buf,
-    size_t len)
+static size_t jpegRead(void *arg, size_t index, uint8_t *buf, size_t len)
 {
-    JpegContext *ctx =
-        (JpegContext *)arg;
-
-    if (!ctx) {
-        return 0;
-    }
-
-    if (index >= ctx->len) {
-        return 0;
-    }
-
-    if (len > ctx->len - index) {
-        len = ctx->len - index;
-    }
-
-    if (buf) {
-        memcpy(
-            buf,
-            ctx->src + index,
-            len
-        );
-    }
-
+    auto *ctx = (JpegContext *)arg;
+    if (!ctx || index >= ctx->len) return 0;
+    if (len > ctx->len - index) len = ctx->len - index;
+    if (buf) memcpy(buf, ctx->src + index, len);
     return len;
 }
 
-
-// ================================================================
-// JPEG WRITER
-// ================================================================
-
-static bool jpegWrite(
-    void *arg,
-    uint16_t x,
-    uint16_t y,
-    uint16_t w,
-    uint16_t h,
-    uint8_t *data)
+static bool jpegWrite(void *arg, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t *data)
 {
-    JpegContext *ctx =
-        (JpegContext *)arg;
+    auto *ctx = (JpegContext *)arg;
+    if (!ctx) return false;
 
-    if (!ctx) {
-        return false;
-    }
-
-
-    // First callback checks dimensions.
-    if (!data) {
-
-        if (x == 0 && y == 0) {
-
-            ctx->dimensionsOk =
-                (w == ctx->width &&
-                 h == ctx->height);
-        }
-
+    if (!data) {   // first callback reports the output size
+        if (x == 0 && y == 0) ctx->dimensionsOk = (w == ctx->width && h == ctx->height);
         return ctx->dimensionsOk;
     }
 
-
-    if (!ctx->dimensionsOk) {
+    if (!ctx->dimensionsOk || (uint32_t)x + w > ctx->width || (uint32_t)y + h > ctx->height) {
         return false;
     }
 
-
-    if ((uint32_t)x + w > ctx->width ||
-        (uint32_t)y + h > ctx->height) {
-
-        return false;
+    for (uint16_t row = 0; row < h; row++) {
+        memcpy(ctx->dst + ((size_t)(y + row) * ctx->width + x) * 3,
+               data + (size_t)row * w * 3,
+               (size_t)w * 3);
     }
-
-
-    for (uint16_t row = 0;
-         row < h;
-         row++) {
-
-        memcpy(
-            ctx->dst +
-                ((size_t)(y + row) *
-                 ctx->width +
-                 x) * 3,
-
-            data +
-                (size_t)row *
-                w * 3,
-
-            (size_t)w * 3
-        );
-    }
-
     return true;
 }
 
@@ -638,67 +237,33 @@ static bool jpegWrite(
 // CAPTURE + PREPROCESS
 // ================================================================
 
-static bool captureModel(
-    CameraTiming &timing,
-    bool prepareModel)
+static bool captureModel(CameraTiming &timing, bool prepareModel)
 {
-    memset(
-        &timing,
-        0,
-        sizeof(timing)
-    );
-
-
-    // ------------------------------------------------------------
-    // CAMERA FRAME
-    // ------------------------------------------------------------
+    timing = {};
 
     uint32_t t0 = micros();
-
-    camera_fb_t *fb =
-        esp_camera_fb_get();
-
-    timing.grabUs =
-        micros() - t0;
-
+    camera_fb_t *fb = esp_camera_fb_get();
+    timing.grabUs = micros() - t0;
 
     if (!fb) {
-
-        Serial.println(
-            "[CAM] ERROR: fb_get() failed."
-        );
-
+        Serial.println("[CAM] ERROR: fb_get() failed.");
         return false;
     }
 
-
-    if (fb->format != PIXFORMAT_JPEG ||
-        fb->width != CAMERA_WIDTH ||
-        fb->height != CAMERA_HEIGHT) {
-
-        Serial.printf(
-            "[CAM] ERROR: format=%d size=%ux%u\n",
-            (int)fb->format,
-            (unsigned)fb->width,
-            (unsigned)fb->height
-        );
-
+    if (fb->format != PIXFORMAT_JPEG || fb->width != CAM_WIDTH || fb->height != CAM_HEIGHT) {
+        Serial.printf("[CAM] ERROR: format=%d size=%ux%u\n",
+                      (int)fb->format, (unsigned)fb->width, (unsigned)fb->height);
         esp_camera_fb_return(fb);
-
         return false;
     }
 
-
-    if (fb->len <= 128 * 1024) {
-        if (jpegMutex) {
-            xSemaphoreTake(jpegMutex, portMAX_DELAY);
-        }
-        memcpy(latestJpeg, fb->buf, fb->len);
-        latestJpegLength = fb->len;
-        latestFrameMs = millis();
-        if (jpegMutex) {
-            xSemaphoreGive(jpegMutex);
-        }
+    // Update the web frame only if the web task isn't sending it right now,
+    // so a slow client can never stall the camera loop.
+    if (fb->len <= WEB_JPEG_MAX && xSemaphoreTake(jpegMutex, 0) == pdTRUE) {
+        memcpy(webJpeg, fb->buf, fb->len);
+        webJpegLen = fb->len;
+        status.frameMs = millis();
+        xSemaphoreGive(jpegMutex);
     }
 
     if (!prepareModel) {
@@ -706,83 +271,50 @@ static bool captureModel(
         return true;
     }
 
-    // ------------------------------------------------------------
-    // JPEG -> RGB888 at half resolution for faster inference
-    // ------------------------------------------------------------
-
-    JpegContext ctx = {
-        fb->buf,
-        fb->len,
-        fullRgb,
-        INFERENCE_WIDTH,
-        INFERENCE_HEIGHT,
-        false
-    };
-
+    // JPEG -> RGB888 at half resolution (faster than full decode)
+    JpegContext ctx = {fb->buf, fb->len, srcRgb, SRC_WIDTH, SRC_HEIGHT, false};
 
     t0 = micros();
+    const esp_err_t jpegErr = esp_jpg_decode(fb->len, JPG_SCALE_2X, jpegRead, jpegWrite, &ctx);
+    timing.decodeUs = micros() - t0;
 
-    esp_err_t jpegErr =
-        esp_jpg_decode(
-            fb->len,
-            JPG_SCALE_2X,
-            jpegRead,
-            jpegWrite,
-            &ctx
-        );
+    esp_camera_fb_return(fb);
 
-    timing.decodeUs =
-        micros() - t0;
-
-
-    if (jpegErr != ESP_OK ||
-        !ctx.dimensionsOk) {
-
-        Serial.printf(
-            "[CAM] ERROR: JPEG decode failed: 0x%x\n",
-            (unsigned)jpegErr
-        );
-
-        esp_camera_fb_return(fb);
-
+    if (jpegErr != ESP_OK || !ctx.dimensionsOk) {
+        Serial.printf("[CAM] ERROR: JPEG decode failed: 0x%x\n", (unsigned)jpegErr);
         return false;
     }
 
-        esp_camera_fb_return(fb);
-
-
-    // ------------------------------------------------------------
-    // RGB888 160x120 -> RGB888 96x96
-    // ------------------------------------------------------------
-
+    // 160x120 -> 96x96
     t0 = micros();
-
-    bool resizeOk =
-        squashRgb888(
-            fullRgb,
-            INFERENCE_WIDTH,
-            INFERENCE_HEIGHT,
-            modelRgb,
-            MODEL_WIDTH,
-            MODEL_HEIGHT
-        );
-
-    timing.resizeUs =
-        micros() - t0;
-
-
-    if (!resizeOk) {
-
-        Serial.println(
-            "[IMAGE] ERROR: resize failed."
-        );
-
-        return false;
-    }
-
+    squashRgb888(srcRgb, SRC_WIDTH, SRC_HEIGHT, modelRgb, MODEL_WIDTH, MODEL_HEIGHT);
+    timing.resizeUs = micros() - t0;
 
     return true;
 }
+
+
+// ================================================================
+// EDGE IMPULSE SIGNAL: one float per pixel, packed 0xRRGGBB
+// ================================================================
+
+static int getData(size_t offset, size_t length, float *out)
+{
+    if (!out || offset > MODEL_PIXELS || length > MODEL_PIXELS - offset) {
+        return -1;
+    }
+
+    const uint8_t *p = modelRgb + offset * 3;
+    for (size_t i = 0; i < length; i++, p += 3) {
+        out[i] = (float)(((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2]);
+    }
+    return EIDSP_OK;
+}
+
+
+// ================================================================
+// WEB SERVER (Wi-Fi AP: live snapshot + detection status)
+// ================================================================
 
 static void handleWebRoot()
 {
@@ -791,7 +323,7 @@ static void handleWebRoot()
 <title>AI Smart Glasses</title>
 <style>
 body{font-family:system-ui;background:#111;color:#eee;margin:16px}
-img{width:min(100%,640px);image-rendering:auto;border:2px solid #555}
+img{width:min(100%,640px);border:2px solid #555}
 pre{white-space:pre-wrap;background:#222;padding:12px;border-radius:8px}
 </style></head><body>
 <h2>ESP32-S3 Camera + FOMO</h2>
@@ -824,43 +356,31 @@ updateImage(); updateStatus();
 
 static void handleWebSnapshot()
 {
-    if (!latestJpeg || latestJpegLength == 0) {
+    if (webJpegLen == 0) {
         webServer.send(503, "text/plain", "No camera frame available");
         return;
     }
 
     webServer.sendHeader("Cache-Control", "no-store");
     webServer.sendHeader("Connection", "close");
-    if (jpegMutex) {
-        xSemaphoreTake(jpegMutex, portMAX_DELAY);
-    }
-    const size_t frameLength = latestJpegLength;
-    webServer.setContentLength(frameLength);
+
+    xSemaphoreTake(jpegMutex, portMAX_DELAY);
+    webServer.setContentLength(webJpegLen);
     webServer.send(200, "image/jpeg", "");
     WiFiClient client = webServer.client();
-    client.write(latestJpeg, frameLength);
-    if (jpegMutex) {
-        xSemaphoreGive(jpegMutex);
-    }
+    client.write(webJpeg, webJpegLen);
+    xSemaphoreGive(jpegMutex);
 }
 
 static void handleWebStatus()
 {
     char json[256];
-    snprintf(
-        json,
-        sizeof(json),
-        "{\"detection\":\"%s\",\"confidence\":%.3f,\"boxes\":%lu,\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u,\"inference_ms\":%lu,\"frame_age_ms\":%lu}",
-        latestDetection,
-        (double)latestConfidence,
-        (unsigned long)latestBoxes,
-        (unsigned)latestBoxX,
-        (unsigned)latestBoxY,
-        (unsigned)latestBoxWidth,
-        (unsigned)latestBoxHeight,
-        (unsigned long)latestInferenceMs,
-        (unsigned long)(millis() - latestFrameMs)
-    );
+    snprintf(json, sizeof(json),
+             "{\"detection\":\"%s\",\"confidence\":%.3f,\"boxes\":%lu,\"x\":%u,\"y\":%u,"
+             "\"width\":%u,\"height\":%u,\"inference_ms\":%lu,\"frame_age_ms\":%lu}",
+             status.label, (double)status.conf, (unsigned long)status.boxes,
+             (unsigned)status.x, (unsigned)status.y, (unsigned)status.w, (unsigned)status.h,
+             (unsigned long)status.inferMs, (unsigned long)(millis() - status.frameMs));
     webServer.send(200, "application/json", json);
 }
 
@@ -887,380 +407,150 @@ static void beginWebServer()
     webServer.on("/snapshot.jpg", HTTP_GET, handleWebSnapshot);
     webServer.on("/status", HTTP_GET, handleWebStatus);
     webServer.begin();
-    jpegMutex = xSemaphoreCreateMutex();
-    if (!jpegMutex) {
-        Serial.println("[WEB] ERROR: JPEG mutex allocation failed.");
-        return;
-    }
-    xTaskCreatePinnedToCore(
-        webServerTask,
-        "web-server",
-        4096,
-        nullptr,
-        1,
-        nullptr,
-        0
-    );
+    xTaskCreatePinnedToCore(webServerTask, "web-server", 8192, nullptr, 1, nullptr, 0);
 
-    Serial.printf("[WEB] Connect to Wi-Fi '%s' password '%s'\n", ssid, password);
-    Serial.printf("[WEB] Open http://%s/\n", WiFi.softAPIP().toString().c_str());
+    Serial.printf("[WEB] Wi-Fi '%s' password '%s' -> http://%s/\n",
+                  ssid, password, WiFi.softAPIP().toString().c_str());
 }
 
 
 // ================================================================
-// EDGE IMPULSE IMAGE SIGNAL
+// ALERTS: voice track + beep pattern per class
 // ================================================================
 //
-// Edge Impulse expects one float per pixel.
-// For RGB images, the pixel is packed as:
-//
-//     0xRRGGBB
-//
-// Example:
-//     R=255 G=0 B=0
-//
-//     0xFF0000
-//
-// This is NOT 3 floats per pixel.
+// Beep patterns work without language:
+//   stop sign = 4 fast high beeps   car    = 3 beeps   person = 2 beeps
+//   door      = 1 long low beep     chair  = 1 short low beep
 // ================================================================
 
-static int getData(
-    size_t offset,
-    size_t length,
-    float *out)
-{
-    if (!out) {
-        return -1;
-    }
+struct Beep  { uint16_t freq, onMs, offMs; uint8_t count; };
+struct Alert { const char *label; uint8_t track; Beep beep; };
 
-    if (offset > MODEL_PIXELS) {
-        return -1;
-    }
-
-    if (length >
-        MODEL_PIXELS - offset) {
-
-        return -1;
-    }
-
-
-    const uint8_t *p =
-        modelRgb + offset * 3;
-
-
-    for (size_t i = 0;
-         i < length;
-         i++) {
-
-        uint32_t rgb =
-            ((uint32_t)p[0] << 16) |
-            ((uint32_t)p[1] << 8) |
-            ((uint32_t)p[2]);
-
-        out[i] =
-            (float)rgb;
-
-        p += 3;
-    }
-
-
-    return EIDSP_OK;
-}
-
-
-// ================================================================
-// AUDIO
-// ================================================================
-
-#if ENABLE_AUDIO
-
-constexpr int AUDIO_RX_PIN = 2;
-constexpr int AUDIO_TX_PIN = 1;
-
-constexpr uint8_t AUDIO_VOLUME = 25;
-
-constexpr uint8_t AUDIO_FOLDER = 1;
-
-
-// ---------------------------------------------------------------
-// Keep the track order aligned with the five model labels and /01/001.mp3...
-// ---------------------------------------------------------------
-
-struct AudioMapping {
-
-    const char *label;
-
-    uint8_t track;
-
-    uint32_t lastPlayed;
+static const Alert alerts[] = {
+    {"car",       1, {1000, 150, 150, 3}},
+    {"chair",     2, { 600, 150, 150, 1}},
+    {"door",      3, { 500, 700,   0, 1}},
+    {"person",    4, {1000, 150, 150, 2}},
+    {"stop sign", 5, {2000,  80,  80, 4}},
 };
+constexpr size_t ALERT_COUNT = sizeof(alerts) / sizeof(alerts[0]);
 
+static uint32_t lastAlertMs = 0;
 
-static AudioMapping audioMap[] = {
-
-    {
-        "car",
-        1,
-        0
-    },
-    {
-        "chair",
-        2,
-        0
-    },
-    {
-        "door",
-        3,
-        0
-    },
-    {
-        "person",
-        4,
-        0
-    },
-    {
-        "stop sign",
-        5,
-        0
-    }
-
-};
-
-
-constexpr size_t AUDIO_COUNT =
-    sizeof(audioMap) /
-    sizeof(audioMap[0]);
-
-
-static YX5300_ESP32 *player = nullptr;
-static uint32_t lastAudioPlayed = 0;
-
-
-// ---------------------------------------------------------------
-// Find audio mapping
-// ---------------------------------------------------------------
-
-static int findAudio(
-    const char *label)
+static int findAlert(const char *label)
 {
-    if (!label) {
-        return -1;
+    for (size_t i = 0; label && i < ALERT_COUNT; i++) {
+        if (strcmp(label, alerts[i].label) == 0) return (int)i;
     }
-
-
-    for (size_t i = 0;
-         i < AUDIO_COUNT;
-         i++) {
-
-        if (strcmp(
-                label,
-                audioMap[i].label) == 0) {
-
-            return (int)i;
-        }
-    }
-
-
     return -1;
 }
 
 
-// ---------------------------------------------------------------
-// Play audio
-// ---------------------------------------------------------------
+// ---------------- Buzzer (own task, never blocks inference) ----------------
 
-static void playAudio(
-    size_t index)
+#if ENABLE_BUZZER
+
+constexpr int BUZZER_PIN = 14;
+constexpr int BUZZER_CH  = 2;      // camera uses LEDC channel 0 / timer 0
+
+static volatile int8_t beepRequest = -1;
+
+static void buzz(uint16_t freq)
 {
-    if (!player) {
-        Serial.println(
-            "[AUDIO] ERROR: player is NULL."
-        );
-
-        return;
-    }
-
-
-    if (index >= AUDIO_COUNT) {
-        return;
-    }
-
-
-    const char *label =
-        audioMap[index].label;
-
-    uint8_t track =
-        audioMap[index].track;
-
-
-    Serial.printf(
-        "[AUDIO] PLAY: %s | folder=%02u | track=%03u\n",
-        label,
-        (unsigned)AUDIO_FOLDER,
-        (unsigned)track
-    );
-
-
-    player->playTrackInFolder(
-        track,
-        AUDIO_FOLDER
-    );
-
-
-    audioMap[index].lastPlayed = millis();
-    lastAudioPlayed = audioMap[index].lastPlayed;
+#if BUZZER_ACTIVE
+    digitalWrite(BUZZER_PIN, freq ? HIGH : LOW);
+#else
+    ledcWriteTone(BUZZER_CH, freq);   // 0 = silence
+#endif
 }
 
-
-// ---------------------------------------------------------------
-// Start YX5300
-// ---------------------------------------------------------------
-
-static void beginAudio()
+static void buzzerTask(void *)
 {
-    Serial.println();
-    Serial.println(
-        "[AUDIO] Initializing YX5300..."
-    );
+    for (;;) {
+        const int8_t i = beepRequest;
+        if (i < 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        beepRequest = -1;
 
+        const Beep &b = alerts[i].beep;
+        for (uint8_t n = 0; n < b.count; n++) {
+            buzz(b.freq);
+            vTaskDelay(pdMS_TO_TICKS(b.onMs));
+            buzz(0);
+            vTaskDelay(pdMS_TO_TICKS(b.offMs));
+        }
+    }
+}
 
-    delay(1000);
+static void beginBuzzer()
+{
+#if BUZZER_ACTIVE
+    pinMode(BUZZER_PIN, OUTPUT);
+#else
+    ledcSetup(BUZZER_CH, 2000, 8);
+    ledcAttachPin(BUZZER_PIN, BUZZER_CH);
+#endif
+    buzz(0);
+    xTaskCreate(buzzerTask, "buzzer", 2048, nullptr, 1, nullptr);
 
+    buzz(2000);                 // short boot chirp to confirm wiring
+    delay(100);
+    buzz(0);
 
-    // Keep object alive for entire program.
-    static YX5300_ESP32 module(
-        Serial2,
-        AUDIO_RX_PIN,
-        AUDIO_TX_PIN
-    );
-
-
-    player = &module;
-
-
-    delay(500);
-
-
-    player->setVolume(
-        AUDIO_VOLUME
-    );
-
-    player->unmute();
-
-    delay(300);
-
-
-    Serial.println(
-        "[AUDIO] YX5300 initialized."
-    );
-
-    Serial.printf(
-        "[AUDIO] UART RX=GPIO%d TX=GPIO%d\n",
-        AUDIO_RX_PIN,
-        AUDIO_TX_PIN
-    );
-
-    Serial.printf(
-        "[AUDIO] Volume=%u\n",
-        (unsigned)AUDIO_VOLUME
-    );
-
-    Serial.printf(
-        "[AUDIO] Tracks on TF card=%d | module volume=%d\n",
-        player->queryTrackCount(),
-        player->queryCurrentVolume()
-    );
-
-
-    // ------------------------------------------------------------
-    // BOOT AUDIO TEST
-    // ------------------------------------------------------------
-
-    Serial.println(
-        "[AUDIO] Playing CAR test audio..."
-    );
-
-    playAudio(0);
-
-
-    // Do not block the web/inference loop while the module starts playback.
+    Serial.printf("[BUZZER] GPIO%d ready (%s)\n", BUZZER_PIN, BUZZER_ACTIVE ? "active" : "passive");
 }
 
 #endif
 
 
-// ================================================================
-// PRINT MODEL INFORMATION
-// ================================================================
+// ---------------- YX5300 voice ----------------
 
-static void printModelInfo()
+#if ENABLE_AUDIO
+
+constexpr int     AUDIO_RX_PIN = 2, AUDIO_TX_PIN = 1;
+constexpr uint8_t AUDIO_VOLUME = 25;
+constexpr uint8_t AUDIO_FOLDER = 1;
+
+static YX5300_ESP32 *player = nullptr;
+
+static void beginAudio()
 {
-    Serial.println();
-    Serial.println(
-        "========================================"
-    );
+    Serial.println("\n[AUDIO] Initializing YX5300...");
+    delay(1000);
 
-    Serial.println(
-        "EDGE IMPULSE MODEL INFORMATION"
-    );
+    static YX5300_ESP32 module(Serial2, AUDIO_RX_PIN, AUDIO_TX_PIN);
+    player = &module;
 
-    Serial.println(
-        "========================================"
-    );
+    delay(500);
+    player->setVolume(AUDIO_VOLUME);
+    player->unmute();
+    delay(300);
 
+    Serial.printf("[AUDIO] RX=GPIO%d TX=GPIO%d volume=%u | tracks=%d module volume=%d\n",
+                  AUDIO_RX_PIN, AUDIO_TX_PIN, (unsigned)AUDIO_VOLUME,
+                  player->queryTrackCount(), player->queryCurrentVolume());
 
-    Serial.printf(
-        "Input: %dx%d\n",
-        EI_CLASSIFIER_INPUT_WIDTH,
-        EI_CLASSIFIER_INPUT_HEIGHT
-    );
+    // Boot test: play the car track once.
+    player->playTrackInFolder(alerts[0].track, AUDIO_FOLDER);
+}
 
-
-    Serial.printf(
-        "Labels: %d\n",
-        EI_CLASSIFIER_LABEL_COUNT
-    );
+#endif
 
 
-    Serial.printf(
-        "Object detection: %d\n",
-        EI_CLASSIFIER_OBJECT_DETECTION
-    );
+static void announce(size_t i)
+{
+    Serial.printf("[ALERT] %s\n", alerts[i].label);
 
+#if ENABLE_AUDIO
+    if (player) player->playTrackInFolder(alerts[i].track, AUDIO_FOLDER);
+#endif
+#if ENABLE_BUZZER
+    beepRequest = (int8_t)i;
+#endif
 
-    Serial.printf(
-        "Detection threshold: %.2f\n",
-        (double)
-        EI_CLASSIFIER_OBJECT_DETECTION_THRESHOLD
-    );
-
-
-    Serial.println(
-        "Model labels:"
-    );
-
-
-    for (int i = 0;
-         i < EI_CLASSIFIER_LABEL_COUNT;
-         i++) {
-
-        Serial.printf(
-            "  [%d] %s\n",
-            i,
-            ei_classifier_inferencing_categories[i]
-        );
-    }
-
-
-    Serial.println();
-    Serial.println("AUDIO CLASSES (/01): car=001 chair=002 door=003 person=004 stop sign=005");
-
-
-    Serial.println(
-        "========================================"
-    );
-
-    Serial.println();
+    lastAlertMs = millis();
 }
 
 
@@ -1268,99 +558,50 @@ static void printModelInfo()
 // SETUP
 // ================================================================
 
+static void printModelInfo()
+{
+    Serial.printf("\nModel: %dx%d | labels=%d | detection=%d | threshold=%.2f\n",
+                  EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT,
+                  EI_CLASSIFIER_LABEL_COUNT, EI_CLASSIFIER_OBJECT_DETECTION,
+                  (double)EI_CLASSIFIER_OBJECT_DETECTION_THRESHOLD);
+
+    for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        Serial.printf("  [%d] %s\n", i, ei_classifier_inferencing_categories[i]);
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
-
     delay(2000);
 
-
-    Serial.println();
-    Serial.println();
-    Serial.println(
-        "========================================"
-    );
-
-    Serial.println(
-        "AI SMART GLASSES"
-    );
-
-    Serial.println(
-        "ESP32-S3 + OV3660 + Edge Impulse FOMO"
-    );
-
-    Serial.println("FIVE-CLASS REAL-TIME DETECTION");
-
-    Serial.println(
-        "========================================"
-    );
-
-
-    // ------------------------------------------------------------
-    // Model information
-    // ------------------------------------------------------------
+    Serial.println("\n========================================");
+    Serial.println("AI SMART GLASSES | ESP32-S3 + OV3660 + FOMO");
+    Serial.println("========================================");
 
     printModelInfo();
 
-
-    // ------------------------------------------------------------
-    // Camera
-    // ------------------------------------------------------------
+    jpegMutex = xSemaphoreCreateMutex();
 
     if (!beginCamera()) {
-
-        Serial.println(
-            "[BOOT] CAMERA FAILED."
-        );
-
-        while (true) {
-            delay(1000);
-        }
+        Serial.println("[BOOT] CAMERA FAILED.");
+        while (true) delay(1000);
     }
 
-
-    // ------------------------------------------------------------
-    // Edge Impulse
-    // ------------------------------------------------------------
-
-    Serial.println(
-        "[EI] Initializing classifier..."
-    );
-
-
+    Serial.println("[EI] Initializing classifier...");
     run_classifier_init();
-
-
-    Serial.println(
-        "[EI] Classifier initialized."
-    );
+    Serial.println("[EI] Classifier initialized.");
 
     beginWebServer();
 
-
-    // ------------------------------------------------------------
-    // Audio
-    // ------------------------------------------------------------
-
+#if ENABLE_BUZZER
+    beginBuzzer();
+#endif
 #if ENABLE_AUDIO
-
     beginAudio();
-
 #endif
 
-
-    Serial.println();
-    Serial.println(
-        "[BOOT] SYSTEM READY."
-    );
-
-    Serial.println("[BOOT] Detecting car, chair, door, person, and stop sign.");
-
-    Serial.println(
-        "[BOOT] Serial monitor = 115200."
-    );
-
-    Serial.println();
+    Serial.println("\n[BOOT] SYSTEM READY.\n");
 }
 
 
@@ -1370,174 +611,73 @@ void setup()
 
 void loop()
 {
-    static uint32_t lastTimingLog = 0;
-    static uint32_t lastInferenceStart = 0;
+    static uint32_t lastInferenceMs = 0, lastLogMs = 0;
+
+    const bool infer = lastInferenceMs == 0 || millis() - lastInferenceMs >= INFERENCE_INTERVAL_MS;
 
     CameraTiming timing;
-    const bool runInference =
-        (lastInferenceStart == 0) ||
-        (millis() - lastInferenceStart >= INFERENCE_INTERVAL_MS);
-
-
-    // ------------------------------------------------------------
-    // CAPTURE
-    // ------------------------------------------------------------
-
-    if (!captureModel(timing, runInference)) {
-
-        Serial.println(
-            "[LOOP] Capture failed."
-        );
-
+    if (!captureModel(timing, infer)) {
         delay(100);
-
         return;
     }
-
-    if (!runInference) {
+    if (!infer) {
         delay(1);
         return;
     }
 
-    // ------------------------------------------------------------
-    // EDGE IMPULSE SIGNAL
-    // ------------------------------------------------------------
-
     signal_t signal = {};
-
-    signal.total_length =
-        MODEL_PIXELS;
-
-    signal.get_data =
-        getData;
-
-
-    // ------------------------------------------------------------
-    // RUN MODEL
-    // ------------------------------------------------------------
+    signal.total_length = MODEL_PIXELS;
+    signal.get_data = getData;
 
     ei_impulse_result_t result = {};
 
-
-    uint32_t inferenceStart =
-        millis();
-    lastInferenceStart = inferenceStart;
-
-
-    EI_IMPULSE_ERROR err =
-        run_classifier(
-            &signal,
-            &result,
-            false
-        );
-
-
-    uint32_t inferenceTime =
-        millis() - inferenceStart;
-    // Schedule the next inference after this one finishes. Measuring from
-    // the start caused a long inference to immediately run again.
-    lastInferenceStart = millis();
-
+    const uint32_t t0 = millis();
+    const EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+    const uint32_t inferMs = millis() - t0;
+    lastInferenceMs = millis();   // next inference is scheduled after this one finishes
 
     if (err != EI_IMPULSE_OK) {
-
-        Serial.printf(
-            "[EI] ERROR: run_classifier() = %d\n",
-            (int)err
-        );
-
+        Serial.printf("[EI] ERROR: run_classifier() = %d\n", (int)err);
         delay(200);
-
         return;
     }
 
-    // ------------------------------------------------------------
-    // PRINT TIMING
-    // ------------------------------------------------------------
-
-    if (millis() - lastTimingLog >= 1000UL) {
-        Serial.printf(
-            "[TIME] grab=%.1f ms | decode=%.1f ms | resize=%.1f ms | DSP=%lu ms | NN=%lu ms | total=%lu ms\n",
-            timing.grabUs / 1000.0,
-            timing.decodeUs / 1000.0,
-            timing.resizeUs / 1000.0,
-            (unsigned long)result.timing.dsp,
-            (unsigned long)result.timing.classification,
-            (unsigned long)inferenceTime
-        );
-        lastTimingLog = millis();
+    if (millis() - lastLogMs >= 1000UL) {
+        Serial.printf("[TIME] grab=%.1f decode=%.1f resize=%.1f | DSP=%lu NN=%lu total=%lu ms\n",
+                      timing.grabUs / 1000.0, timing.decodeUs / 1000.0, timing.resizeUs / 1000.0,
+                      (unsigned long)result.timing.dsp,
+                      (unsigned long)result.timing.classification,
+                      (unsigned long)inferMs);
+        lastLogMs = millis();
     }
 
-
-    // ------------------------------------------------------------
-    // DETECTIONS
-    // ------------------------------------------------------------
-
-    if (result.bounding_boxes_count == 0) {
-        strcpy(latestDetection, "none");
-        latestConfidence = 0.0f;
-        latestBoxes = 0;
-        latestBoxX = 0;
-        latestBoxY = 0;
-        latestBoxWidth = 0;
-        latestBoxHeight = 0;
-        latestInferenceMs = inferenceTime;
-
-        Serial.println(
-            "[DETECT] No bounding boxes."
-        );
-
-        return;
-    }
-
-    float bestConfidence = 0.0f;
-    const char *bestLabel = nullptr;
-    uint32_t bestBoxIndex = 0;
-
-    for (uint32_t i = 0;
-         i < result.bounding_boxes_count;
-         i++) {
+    // Strongest box only: one alert per inference.
+    int best = -1;
+    float bestValue = 0.0f;
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         const auto &bb = result.bounding_boxes[i];
-        if (bb.label && bb.value > bestConfidence) {
-            bestConfidence = bb.value;
-            bestLabel = bb.label;
-            bestBoxIndex = i;
+        if (bb.label && bb.value > bestValue) {
+            bestValue = bb.value;
+            best = (int)i;
         }
     }
 
-    strncpy(
-        latestDetection,
-        bestLabel ? bestLabel : "none",
-        sizeof(latestDetection) - 1
-    );
-    latestDetection[sizeof(latestDetection) - 1] = '\0';
-    latestConfidence = bestConfidence;
-    latestBoxes = result.bounding_boxes_count;
-    latestBoxX = result.bounding_boxes[bestBoxIndex].x;
-    latestBoxY = result.bounding_boxes[bestBoxIndex].y;
-    latestBoxWidth = result.bounding_boxes[bestBoxIndex].width;
-    latestBoxHeight = result.bounding_boxes[bestBoxIndex].height;
-    latestInferenceMs = inferenceTime;
+    const auto *bb = best >= 0 ? &result.bounding_boxes[best] : nullptr;
+    snprintf(status.label, sizeof(status.label), "%s", bb ? bb->label : "none");
+    status.conf    = bb ? bb->value : 0.0f;
+    status.boxes   = result.bounding_boxes_count;
+    status.x       = bb ? bb->x : 0;
+    status.y       = bb ? bb->y : 0;
+    status.w       = bb ? bb->width : 0;
+    status.h       = bb ? bb->height : 0;
+    status.inferMs = inferMs;
 
-#if ENABLE_AUDIO
-    // Only announce the strongest object. Sending one command per bounding
-    // box makes the YX5300 interrupt itself and can make playback appear stuck.
-    if (bestLabel && bestConfidence >= DETECTION_THRESHOLD) {
-        const int audioIndex = findAudio(bestLabel);
-        const uint32_t now = millis();
-        const bool classReady =
-            audioIndex >= 0 &&
-            (audioMap[audioIndex].lastPlayed == 0 ||
-             now - audioMap[audioIndex].lastPlayed >= AUDIO_COOLDOWN_MS);
-        const bool playerReady =
-            lastAudioPlayed == 0 ||
-            now - lastAudioPlayed >= AUDIO_COOLDOWN_MS;
+    if (!bb || bb->value < DETECTION_THRESHOLD) return;
 
-        if (classReady && playerReady) {
-            Serial.printf("[AUDIO] %s %.3f\n", bestLabel, (double)bestConfidence);
-            playAudio((size_t)audioIndex);
-        }
+    Serial.printf("[DETECT] %s %.3f\n", bb->label, (double)bb->value);
+
+    const int alert = findAlert(bb->label);
+    if (alert >= 0 && (lastAlertMs == 0 || millis() - lastAlertMs >= ALERT_COOLDOWN_MS)) {
+        announce((size_t)alert);
     }
-#endif
-
 }
